@@ -71,6 +71,9 @@ const NO_RECALL_VALUES = new Set([
 const TIMEOUT_BOILERPLATE_PATTERNS = [
   /^(?:error:\s*)?(?:the\s+)?(?:llm|model|request|operation|agent)\s+(?:request\s+)?timed out\b/i,
   /^(?:error:\s*)?active-memory timeout after \d+ms\b/i,
+  /request timed out before a response was generated/i,
+  /please try again, or increase/i,
+  /agents\.defaults\.timeoutseconds/i,
 ];
 
 const RECALLED_CONTEXT_LINE_PATTERNS = [
@@ -218,6 +221,7 @@ type RecallSubagentResult = {
   rawReply: string;
   transcriptPath?: string;
   searchDebug?: ActiveMemorySearchDebug;
+  terminalStatus?: "empty" | "unavailable";
 };
 
 type TerminalMemorySearchResult = {
@@ -1779,6 +1783,145 @@ function readActiveMemorySearchDebugFromRunResult(
   );
 }
 
+function extractJsonObjectText(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+  const fenced = /```(?:json|txt)?\s*([\s\S]*?)```/i.exec(trimmed);
+  const fencedBody = fenced?.[1]?.trim();
+  if (fencedBody?.startsWith("{") && fencedBody.endsWith("}")) {
+    return fencedBody;
+  }
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return trimmed.slice(start, end + 1);
+  }
+  return undefined;
+}
+
+function parseJsonObject(value: string | undefined): Record<string, unknown> | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const jsonText = extractJsonObjectText(value);
+  if (!jsonText) {
+    return undefined;
+  }
+  try {
+    return asRecord(JSON.parse(jsonText));
+  } catch {
+    return undefined;
+  }
+}
+
+function isFormattedMemorySearchToolOutput(payload: unknown): boolean {
+  const record = asRecord(payload);
+  const text = normalizeOptionalString(record?.text)?.trimStart();
+  return text ? /^🧠\s+Memory Search(?::|\s|$)/u.test(text) : false;
+}
+
+function getMemorySearchResultArrays(
+  parsed: Record<string, unknown>,
+  details: Record<string, unknown> | undefined,
+): unknown[][] {
+  const arrays: unknown[][] = [];
+  if (Array.isArray(parsed.results)) {
+    arrays.push(parsed.results);
+  }
+  if (Array.isArray(details?.results)) {
+    arrays.push(details.results);
+  }
+  return arrays;
+}
+
+function extractEmptyMemorySearchDebugFromToolPayload(
+  payload: unknown,
+): ActiveMemorySearchDebug | undefined {
+  if (!isFormattedMemorySearchToolOutput(payload)) {
+    return undefined;
+  }
+  const record = asRecord(payload);
+  const parsed = parseJsonObject(normalizeOptionalString(record?.text));
+  if (!parsed) {
+    return undefined;
+  }
+  const details = asRecord(parsed.details);
+  const resultArrays = getMemorySearchResultArrays(parsed, details);
+  if (resultArrays.length === 0 || resultArrays.some((results) => results.length > 0)) {
+    return undefined;
+  }
+  if (
+    normalizeOptionalString(parsed.error) ||
+    normalizeOptionalString(parsed.warning) ||
+    normalizeOptionalString(parsed.action) ||
+    parsed.disabled === true ||
+    normalizeOptionalString(details?.error) ||
+    normalizeOptionalString(details?.warning) ||
+    normalizeOptionalString(details?.action) ||
+    details?.disabled === true
+  ) {
+    return undefined;
+  }
+  const debug = normalizeSearchDebug(parsed.debug) ?? normalizeSearchDebug(details?.debug);
+  if (!debug || debug.hits !== 0 || debug.error) {
+    return undefined;
+  }
+  return debug;
+}
+
+function extractUnavailableMemorySearchDebugFromToolPayload(
+  payload: unknown,
+): ActiveMemorySearchDebug | undefined {
+  if (!isFormattedMemorySearchToolOutput(payload)) {
+    return undefined;
+  }
+  const record = asRecord(payload);
+  const parsed = parseJsonObject(normalizeOptionalString(record?.text));
+  if (!parsed) {
+    return undefined;
+  }
+  const details = asRecord(parsed.details);
+  if (getMemorySearchResultArrays(parsed, details).some((results) => results.length > 0)) {
+    return undefined;
+  }
+  const parsedDebug = asRecord(parsed.debug);
+  const detailsDebug = asRecord(details?.debug);
+  const disabled = parsed.disabled === true || details?.disabled === true;
+  const unavailable = parsed.unavailable === true || details?.unavailable === true;
+  const error =
+    normalizeOptionalString(parsed.error) ??
+    normalizeOptionalString(details?.error) ??
+    normalizeOptionalString(parsedDebug?.error) ??
+    normalizeOptionalString(detailsDebug?.error);
+  const warning =
+    normalizeOptionalString(parsed.warning) ??
+    normalizeOptionalString(details?.warning) ??
+    normalizeOptionalString(parsedDebug?.warning) ??
+    normalizeOptionalString(detailsDebug?.warning);
+  const action =
+    normalizeOptionalString(parsed.action) ??
+    normalizeOptionalString(details?.action) ??
+    normalizeOptionalString(parsedDebug?.action) ??
+    normalizeOptionalString(detailsDebug?.action);
+  if (!disabled && !unavailable && !error && !warning && !action) {
+    return undefined;
+  }
+  return (
+    normalizeSearchDebug({
+      ...detailsDebug,
+      ...parsedDebug,
+      error,
+      warning,
+      action,
+    }) ?? { error, warning, action }
+  );
+}
+
 function extractAssistantTextFromSessionRecord(value: unknown): string {
   const record = asRecord(value);
   if (!record) {
@@ -1946,6 +2089,11 @@ function normalizeNoRecallValue(value: string): boolean {
 
 function isTimeoutBoilerplateSummary(value: string): boolean {
   return TIMEOUT_BOILERPLATE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function isTimeoutBoilerplateReply(rawReply: string): boolean {
+  const singleLine = rawReply.trim().replace(/\s+/g, " ").trim();
+  return singleLine ? isTimeoutBoilerplateSummary(singleLine) : false;
 }
 
 function normalizeActiveSummary(rawReply: string): string | null {
@@ -2375,37 +2523,95 @@ async function runRecallSubagent(params: {
     channelId: params.channelId,
   });
 
+  let runAbortSignal: AbortSignal | undefined;
+  let removeParentAbortListener: (() => void) | undefined;
   try {
     const embeddedConfig = applyActiveMemoryRuntimeConfigSnapshot(params.api.config, params.config);
     const embeddedTimeoutMs = params.config.timeoutMs + params.config.setupGraceTimeoutMs;
-    const result = await params.api.runtime.agent.runEmbeddedPiAgent({
-      sessionId: subagentSessionId,
-      sessionKey: subagentSessionKey,
-      agentId: params.agentId,
-      messageChannel,
-      messageProvider,
-      sessionFile,
-      workspaceDir,
-      agentDir,
-      config: embeddedConfig,
-      prompt,
-      provider: modelRef.provider,
-      model: modelRef.model,
-      timeoutMs: embeddedTimeoutMs,
-      runId: subagentSessionId,
-      trigger: "manual",
-      toolsAllow: ["memory_recall", "memory_search", "memory_get"],
-      disableMessageTool: true,
-      allowGatewaySubagentBinding: true,
-      bootstrapContextMode: "lightweight",
-      verboseLevel: "off",
-      thinkLevel: params.config.thinking,
-      reasoningLevel: "off",
-      silentExpected: true,
-      authProfileFailurePolicy: "local",
-      cleanupBundleMcpOnRunEnd: true,
-      abortSignal: params.abortSignal,
+    const runController = new AbortController();
+    runAbortSignal = runController.signal;
+    const abortRun = () => {
+      const reason = params.abortSignal?.reason;
+      if (reason instanceof Error) {
+        runController.abort(reason);
+      } else if (reason !== undefined) {
+        runController.abort(new Error("Operation aborted", { cause: reason }));
+      } else {
+        runController.abort(new Error("Operation aborted"));
+      }
+    };
+    if (params.abortSignal?.aborted) {
+      abortRun();
+    } else {
+      params.abortSignal?.addEventListener("abort", abortRun, { once: true });
+      removeParentAbortListener = () => {
+        params.abortSignal?.removeEventListener("abort", abortRun);
+      };
+    }
+    let resolveEmptySearch: ((result: RecallSubagentResult) => void) | undefined;
+    let emptySearchResult: RecallSubagentResult | undefined;
+    let emptySearchResolved = false;
+    const emptySearchPromise = new Promise<RecallSubagentResult>((resolve) => {
+      resolveEmptySearch = resolve;
     });
+    const runPromise = params.api.runtime.agent
+      .runEmbeddedPiAgent({
+        sessionId: subagentSessionId,
+        sessionKey: subagentSessionKey,
+        agentId: params.agentId,
+        messageChannel,
+        messageProvider,
+        sessionFile,
+        workspaceDir,
+        agentDir,
+        config: embeddedConfig,
+        prompt,
+        provider: modelRef.provider,
+        model: modelRef.model,
+        timeoutMs: embeddedTimeoutMs,
+        runId: subagentSessionId,
+        trigger: "manual",
+        toolsAllow: ["memory_recall", "memory_search", "memory_get"],
+        disableMessageTool: true,
+        allowGatewaySubagentBinding: true,
+        bootstrapContextMode: "lightweight",
+        verboseLevel: "off",
+        thinkLevel: params.config.thinking,
+        reasoningLevel: "off",
+        silentExpected: true,
+        authProfileFailurePolicy: "local",
+        cleanupBundleMcpOnRunEnd: true,
+        abortSignal: runController.signal,
+        shouldEmitToolOutput: () => true,
+        onToolResult: (payload: unknown) => {
+          if (emptySearchResolved) {
+            return;
+          }
+          const unavailableDebug = extractUnavailableMemorySearchDebugFromToolPayload(payload);
+          const emptyDebug = unavailableDebug
+            ? undefined
+            : extractEmptyMemorySearchDebugFromToolPayload(payload);
+          const searchDebug = unavailableDebug ?? emptyDebug;
+          if (!searchDebug) {
+            return;
+          }
+          emptySearchResolved = true;
+          emptySearchResult = {
+            rawReply: "NONE",
+            searchDebug,
+            terminalStatus: "empty",
+          };
+          resolveEmptySearch?.(emptySearchResult);
+          runController.abort(new Error("active-memory terminal memory_search fast-fail"));
+        },
+      })
+      .catch((error: unknown) => {
+        if (emptySearchResolved && runController.signal.aborted && emptySearchResult) {
+          return emptySearchResult;
+        }
+        throw error;
+      });
+    const result = await Promise.race([runPromise, emptySearchPromise]);
     if (params.abortSignal?.aborted) {
       const reason = params.abortSignal.reason;
       if (reason instanceof Error) {
@@ -2417,6 +2623,9 @@ async function runRecallSubagent(params: {
           : new Error("Operation aborted");
       abortErr.name = "AbortError";
       throw abortErr;
+    }
+    if ("rawReply" in result) {
+      return result;
     }
     const rawReply = (result.payloads ?? [])
       .map((payload) => payload.text?.trim() ?? "")
@@ -2432,13 +2641,15 @@ async function runRecallSubagent(params: {
       searchDebug,
     };
   } catch (error) {
-    if (params.abortSignal?.aborted) {
+    const isAbortError = error instanceof Error && error.name === "AbortError";
+    if (params.abortSignal?.aborted || runAbortSignal?.aborted || isAbortError) {
       const partialReply = await readPartialAssistantText(sessionFile);
       const searchDebug = partialReply ? await readActiveMemorySearchDebug(sessionFile) : undefined;
       attachPartialTimeoutData(error, partialReply, searchDebug);
     }
     throw error;
   } finally {
+    removeParentAbortListener?.();
     if (tempDir) {
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
@@ -2633,7 +2844,8 @@ async function maybeResolveActiveRecall(params: {
       return result;
     }
 
-    const { rawReply, transcriptPath, searchDebug } = raceResult;
+    const { rawReply, transcriptPath, searchDebug, terminalStatus } = raceResult;
+    const timeoutBoilerplate = isTimeoutBoilerplateReply(rawReply);
     const summary = truncateSummary(
       normalizeActiveSummary(rawReply) ?? "",
       params.config.maxSummaryChars,
@@ -2651,7 +2863,7 @@ async function maybeResolveActiveRecall(params: {
             searchDebug,
           }
         : {
-            status: "empty",
+            status: timeoutBoilerplate ? "timeout" : (terminalStatus ?? "empty"),
             elapsedMs: Date.now() - startedAt,
             summary: null,
             searchDebug,
@@ -2672,11 +2884,16 @@ async function maybeResolveActiveRecall(params: {
     if (shouldCacheResult(result)) {
       setCachedResult(cacheKey, result, params.config.cacheTtlMs);
     }
-    resetCircuitBreaker(cbKey);
+    if (result.status === "timeout") {
+      recordCircuitBreakerTimeout(cbKey);
+    } else {
+      resetCircuitBreaker(cbKey);
+    }
     return result;
   } catch (error) {
-    if (controller.signal.aborted) {
-      const partialTimeoutData = readPartialTimeoutData(error);
+    const partialTimeoutData = readPartialTimeoutData(error);
+    const isAbortError = error instanceof Error && error.name === "AbortError";
+    if (controller.signal.aborted || (isAbortError && partialTimeoutData.rawReply)) {
       const result = await buildTimeoutRecallResult({
         elapsedMs: Date.now() - startedAt,
         maxSummaryChars: params.config.maxSummaryChars,
@@ -2951,7 +3168,7 @@ export default definePluginEntry({
   },
 });
 
-const testing = {
+const activeMemoryTesting = {
   buildCacheKey,
   buildCircuitBreakerKey,
   buildMetadata,
@@ -2982,4 +3199,4 @@ const testing = {
   },
 };
 
-export { testing as __testing };
+export { activeMemoryTesting as __testing };
