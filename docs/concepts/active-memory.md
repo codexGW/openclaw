@@ -342,10 +342,10 @@ If the connection is weak, it should return `NONE`.
 
 ## Timeout lifecycle
 
-`config.timeoutMs` is the default recall budget. When `config.setupGraceTimeoutMs`
-is unset or `0`, Active Memory gives the blocking memory sub-agent that long to
-produce useful recall before the main reply continues without active-memory
-context.
+`config.timeoutMs` is the default user-visible recall budget. When
+`config.setupGraceTimeoutMs` is unset or `0`, Active Memory gives the blocking
+memory sub-agent that long to produce useful recall before the main reply
+continues without active-memory context.
 
 When `config.setupGraceTimeoutMs` is set, Active Memory adds that explicit grace
 to both the prompt-build watchdog and the embedded recall runner. Use it for
